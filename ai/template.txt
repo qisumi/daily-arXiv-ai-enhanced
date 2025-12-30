@@ -1,4 +1,11 @@
-Please analyze the following abstract of papers. 
+请分析以下学术论文摘要，并用{language}生成结构化信息。
 
-Content:
+要求：
+- 必须使用{language}输出所有字段（tldr、motivation、method、result、conclusion）
+- 保持专业性和准确性
+- 提取关键信息，避免冗余
+
+论文摘要内容：
 {content}
+
+请严格按照要求的结构化格式输出，确保所有内容都使用{language}。
