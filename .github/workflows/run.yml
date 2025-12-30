@@ -16,10 +16,57 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    
+    # 从 data 分支恢复原始数据和缓存（支持 rerun 场景）
+    # Restore raw data and cache from data branch (support rerun scenario)
+    - name: Restore data from data branch
+      run: |
+        today=$(date -u "+%Y-%m-%d")
+        echo "检查 data 分支中的数据... / Checking data from data branch..."
+        
+        # 检查 data 分支是否存在
+        if git ls-remote --heads origin data | grep -q data; then
+          echo "从 data 分支恢复数据... / Restoring data from data branch..."
+          
+          # 获取 data 分支的特定文件
+          git fetch origin data --depth=1
+          
+          # 确保目录存在
+          mkdir -p data/ai_cache
+          
+          # 恢复今日原始数据文件（如果存在）
+          git show origin/data:data/${today}.jsonl > data/${today}.jsonl 2>/dev/null && \
+            echo "✅ 恢复原始数据: data/${today}.jsonl" || \
+            echo "📝 data 分支无今日原始数据"
+          
+          # 恢复 AI 缓存文件（如果存在）
+          git show origin/data:data/ai_cache/cache_${today}.jsonl > data/ai_cache/cache_${today}.jsonl 2>/dev/null && \
+            echo "✅ 恢复 AI 缓存: data/ai_cache/cache_${today}.jsonl" || \
+            echo "📝 data 分支无今日缓存"
+            
+          # 恢复失败记录（如果存在）
+          git show origin/data:data/ai_cache/failed_${today}.jsonl > data/ai_cache/failed_${today}.jsonl 2>/dev/null && \
+            echo "✅ 恢复失败记录: data/ai_cache/failed_${today}.jsonl" || \
+            echo "📝 data 分支无失败记录"
+        else
+          echo "data 分支不存在，将创建新数据 / Data branch does not exist, will create new data"
+          mkdir -p data/ai_cache
+        fi
+
     - name: Install dependencies
       run: |
         curl -LsSf https://astral.sh/uv/install.sh | sh
         uv sync
+    
+    # 缓存 AI 处理结果，避免重复调用 LLM API
+    # Cache AI processing results to avoid repeated LLM API calls
+    - name: Restore AI cache
+      uses: actions/cache@v4
+      with:
+        path: data/ai_cache
+        key: ai-cache-${{ github.run_id }}
+        restore-keys: |
+          ai-cache-
         
     - name: Crawl arXiv papers
       id: crawl_step
@@ -28,11 +75,20 @@ jobs:
         today=$(date -u "+%Y-%m-%d")
         echo "开始爬取 $today 的arXiv论文... / Starting to crawl $today arXiv papers..."
         
-        # 检查今日文件是否已存在，如存在则删除 / Check if today's file exists, delete if found
+        # 检查今日原始数据文件是否已存在（支持增量处理）
+        # Check if today's raw data file exists (support incremental processing)
         if [ -f "data/${today}.jsonl" ]; then
-            echo "🗑️ 发现今日文件已存在，正在删除重新生成... / Found existing today's file, deleting for fresh start..."
-            rm "data/${today}.jsonl"
-            echo "✅ 已删除现有文件：data/${today}.jsonl / Deleted existing file: data/${today}.jsonl"
+            file_size=$(stat -c%s "data/${today}.jsonl" 2>/dev/null || echo "0")
+            if [ "$file_size" -gt 100 ]; then
+                echo "📦 发现今日原始数据文件已存在且有效 (${file_size} bytes)，跳过爬取 / Found valid today's raw data file, skipping crawl..."
+                echo "💡 这可能是 rerun 场景，将复用已有数据 / This might be a rerun, reusing existing data..."
+                echo "crawl_date=$today" >> $GITHUB_OUTPUT
+                echo "爬取已跳过（使用缓存） / Crawl skipped (using cache)"
+                exit 0
+            else
+                echo "🗑️ 发现今日文件但内容无效，正在删除重新生成... / Found today's file but invalid, deleting for fresh start..."
+                rm "data/${today}.jsonl"
+            fi
         else
             echo "📝 今日文件不存在，准备新建... / Today's file doesn't exist, ready to create new one..."
         fi
@@ -104,13 +160,24 @@ jobs:
         today=${{ steps.crawl_step.outputs.crawl_date }}
         echo "开始AI增强处理... / Starting AI enhancement processing..."
         
+        # 确保缓存目录存在 / Ensure cache directory exists
+        mkdir -p data/ai_cache
+        
+        # 显示缓存状态 / Show cache status
+        if [ -f "data/ai_cache/cache_${today}.jsonl" ]; then
+            cached_count=$(wc -l < "data/ai_cache/cache_${today}.jsonl")
+            echo "📦 发现 ${cached_count} 条缓存记录 / Found ${cached_count} cached records"
+        fi
+        
         cd ai
         export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
         export OPENAI_BASE_URL=${{ secrets.OPENAI_BASE_URL }}
+        export TOKEN_GITHUB=${{ secrets.TOKEN_GITHUB }}
         export LANGUAGE="${{ vars.LANGUAGE }}"
         export MODEL_NAME="${{ vars.MODEL_NAME }}"
         
-        python enhance.py --data ../data/${today}.jsonl
+        # 使用缓存进行增量处理 / Use cache for incremental processing
+        python enhance.py --data ../data/${today}.jsonl --use-cache
         
         # 检查AI处理是否成功 / Check if AI processing was successful
         if [ $? -ne 0 ]; then
@@ -287,11 +354,18 @@ jobs:
         
         # 创建临时目录保存数据文件 / Create temporary directory to save data files
         mkdir -p /tmp/data_files/data
+        mkdir -p /tmp/data_files/data/ai_cache
         mkdir -p /tmp/data_files/assets
         
         # 复制数据文件到临时目录 / Copy data files to temporary directory
         cp -r data/* /tmp/data_files/data/ 2>/dev/null || true
         cp assets/file-list.txt /tmp/data_files/assets/ 2>/dev/null || true
+        
+        # 显示缓存文件信息 / Show cache file info
+        if [ -d "data/ai_cache" ]; then
+            echo "📦 AI缓存文件列表 / AI cache files:"
+            ls -la data/ai_cache/ 2>/dev/null || echo "  (empty)"
+        fi
         
         echo "数据文件已保存到临时目录 / Data files saved to temporary directory"
 
@@ -309,6 +383,8 @@ jobs:
         # 这些文件已经保存到临时目录，所以可以安全删除
         # These files are already saved to temporary directory, so safe to remove
         rm -rf data/*.jsonl 2>/dev/null || true
+        rm -rf data/*.md 2>/dev/null || true
+        rm -rf data/ai_cache 2>/dev/null || true
         rm -f assets/file-list.txt 2>/dev/null || true
         
         # 检查 data 分支是否存在 / Check if data branch exists
@@ -332,7 +408,7 @@ jobs:
         
         # 从临时目录恢复数据文件 / Restore data files from temporary directory
         # 确保目录存在 / Ensure directories exist
-        mkdir -p data assets
+        mkdir -p data assets data/ai_cache
         cp -r /tmp/data_files/data/* data/ 2>/dev/null || true
         cp /tmp/data_files/assets/file-list.txt assets/ 2>/dev/null || true
         

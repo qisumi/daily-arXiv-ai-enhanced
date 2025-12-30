@@ -21,10 +21,10 @@ if [ -z "$OPENAI_API_KEY" ]; then
     echo "   export OPENAI_API_KEY=\"your-api-key-here\""
     echo ""
     echo "🔧 可选变量 / Optional variables:"
-    echo "   export OPENAI_BASE_URL=\"https://api.openai.com/v1\"  # API基础URL / API base URL"
+    echo "   export OPENAI_BASE_URL=\"https://ark.cn-beijing.volces.com/api/v3\"  # API基础URL / API base URL"
     echo "   export LANGUAGE=\"Chinese\"                           # 语言设置 / Language setting"
-    echo "   export CATEGORIES=\"cs.CV, cs.CL\"                    # 关注分类 / Categories of interest"
-    echo "   export MODEL_NAME=\"gpt-4o-mini\"                     # 模型名称 / Model name"
+    echo "   export CATEGORIES=\"cs.AI, cs.CL, cs.LG\"                    # 关注分类 / Categories of interest"
+    echo "   export MODEL_NAME=\"deepseek-v3-2-251201\"                     # 模型名称 / Model name"
     echo ""
     echo "💡 设置后重新运行此脚本即可进行完整测试 / After setting, rerun this script for complete testing"
     echo "🚀 或者继续运行部分流程（爬取+去重检查）/ Or continue with partial workflow (crawl + dedup check)"
@@ -42,8 +42,8 @@ else
     # 设置默认值 / Set default values
     export LANGUAGE="${LANGUAGE:-Chinese}"
     export CATEGORIES="${CATEGORIES:-cs.CV, cs.CL}"
-    export MODEL_NAME="${MODEL_NAME:-gpt-4o-mini}"
-    export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+    export MODEL_NAME="${MODEL_NAME:-deepseek-v3-2-251201}"
+    export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}"
     
     echo "🔧 当前配置 / Current configuration:"
     echo "   LANGUAGE: $LANGUAGE"
@@ -108,8 +108,19 @@ cd ..
 # 第三步：AI处理 / Step 3: AI processing
 if [ "$PARTIAL_MODE" = "false" ]; then
     echo "步骤3：AI增强处理... / Step 3: AI enhancement processing..."
+    
+    # 确保缓存目录存在 / Ensure cache directory exists
+    mkdir -p data/ai_cache
+    
+    # 显示缓存状态 / Show cache status
+    if [ -f "data/ai_cache/cache_${today}.jsonl" ]; then
+        cached_count=$(wc -l < "data/ai_cache/cache_${today}.jsonl")
+        echo "📦 发现 ${cached_count} 条缓存记录 / Found ${cached_count} cached records"
+    fi
+    
     cd ai
-    python enhance.py --data ../data/${today}.jsonl
+    # 使用缓存进行增量处理 / Use cache for incremental processing
+    python enhance.py --data ../data/${today}.jsonl --use-cache
     
     if [ $? -ne 0 ]; then
         echo "❌ AI处理失败 / AI processing failed"

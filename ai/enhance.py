@@ -2,10 +2,13 @@ import os
 import json
 import sys
 import re
+import hashlib
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional
 from queue import Queue
 from threading import Lock
+from pathlib import Path
 # INSERT_YOUR_CODE
 import requests
 
@@ -42,6 +45,186 @@ DEFAULT_AI_FIELDS = {
     "result": "Result analysis unavailable",
     "conclusion": "Conclusion extraction failed"
 }
+
+
+class AICache:
+    """
+    AI 处理结果缓存管理器
+    
+    缓存策略:
+    - 使用 JSONL 格式存储，每行一个论文的缓存
+    - 缓存 key 由 arxiv_id + template_hash 组成，确保模板更新后重新处理
+    - 支持增量处理：只处理未缓存或缓存失效的论文
+    """
+    
+    def __init__(self, cache_dir: str = None, template_file: str = "template.txt", system_file: str = "system.txt"):
+        """
+        初始化缓存管理器
+        
+        Args:
+            cache_dir: 缓存目录路径，默认为 ../data/ai_cache
+            template_file: 模板文件路径，用于计算模板哈希
+            system_file: 系统提示文件路径，用于计算模板哈希
+        """
+        if cache_dir is None:
+            # 默认缓存目录在 data/ai_cache
+            cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "ai_cache")
+        
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 计算模板哈希，用于缓存失效判断
+        self.template_hash = self._compute_template_hash(template_file, system_file)
+        
+        # 内存缓存
+        self._cache: Dict[str, Dict] = {}
+        self._cache_loaded = False
+        self._lock = Lock()
+        
+        # 失败记录
+        self._failed_items: List[Dict] = []
+    
+    def _compute_template_hash(self, template_file: str, system_file: str) -> str:
+        """计算模板文件的哈希值"""
+        hasher = hashlib.md5()
+        
+        for filepath in [template_file, system_file]:
+            if os.path.exists(filepath):
+                with open(filepath, 'rb') as f:
+                    hasher.update(f.read())
+        
+        return hasher.hexdigest()[:8]
+    
+    def _get_cache_file(self, date: str = None) -> Path:
+        """获取缓存文件路径"""
+        if date is None:
+            date = datetime.utcnow().strftime("%Y-%m-%d")
+        return self.cache_dir / f"cache_{date}.jsonl"
+    
+    def _get_failed_file(self, date: str = None) -> Path:
+        """获取失败记录文件路径"""
+        if date is None:
+            date = datetime.utcnow().strftime("%Y-%m-%d")
+        return self.cache_dir / f"failed_{date}.jsonl"
+    
+    def load_cache(self, date: str = None) -> None:
+        """加载缓存文件到内存"""
+        cache_file = self._get_cache_file(date)
+        
+        with self._lock:
+            self._cache.clear()
+            
+            if cache_file.exists():
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        try:
+                            item = json.loads(line.strip())
+                            arxiv_id = item.get('id')
+                            tmpl_hash = item.get('_template_hash', '')
+                            
+                            # 只有模板哈希匹配的缓存才有效
+                            if arxiv_id and tmpl_hash == self.template_hash:
+                                self._cache[arxiv_id] = item
+                        except json.JSONDecodeError:
+                            continue
+                
+                print(f"Loaded {len(self._cache)} valid cached items from {cache_file}", file=sys.stderr)
+            
+            self._cache_loaded = True
+    
+    def get(self, arxiv_id: str) -> Optional[Dict]:
+        """获取缓存的处理结果"""
+        if not self._cache_loaded:
+            self.load_cache()
+        
+        with self._lock:
+            cached = self._cache.get(arxiv_id)
+            if cached:
+                # 检查是否有有效的 AI 字段（不是默认值）
+                ai_data = cached.get('AI', {})
+                if ai_data and ai_data.get('tldr') != DEFAULT_AI_FIELDS['tldr']:
+                    return cached
+            return None
+    
+    def set(self, item: Dict) -> None:
+        """保存处理结果到缓存"""
+        arxiv_id = item.get('id')
+        if not arxiv_id:
+            return
+        
+        # 添加模板哈希和时间戳
+        item['_template_hash'] = self.template_hash
+        item['_cached_at'] = datetime.utcnow().isoformat()
+        
+        with self._lock:
+            self._cache[arxiv_id] = item
+    
+    def save_cache(self, date: str = None) -> None:
+        """保存缓存到文件"""
+        cache_file = self._get_cache_file(date)
+        
+        with self._lock:
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                for item in self._cache.values():
+                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
+            
+            print(f"Saved {len(self._cache)} items to cache: {cache_file}", file=sys.stderr)
+    
+    def record_failure(self, item: Dict, reason: str) -> None:
+        """记录处理失败的论文"""
+        failure_record = {
+            'id': item.get('id'),
+            'title': item.get('title', ''),
+            'reason': reason,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        with self._lock:
+            self._failed_items.append(failure_record)
+    
+    def save_failures(self, date: str = None) -> None:
+        """保存失败记录到文件"""
+        if not self._failed_items:
+            return
+        
+        failed_file = self._get_failed_file(date)
+        
+        with self._lock:
+            with open(failed_file, 'w', encoding='utf-8') as f:
+                for item in self._failed_items:
+                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
+            
+            print(f"Saved {len(self._failed_items)} failure records to: {failed_file}", file=sys.stderr)
+    
+    def get_failed_ids(self, date: str = None) -> List[str]:
+        """获取失败的论文 ID 列表"""
+        failed_file = self._get_failed_file(date)
+        failed_ids = []
+        
+        if failed_file.exists():
+            with open(failed_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        item = json.loads(line.strip())
+                        if item.get('id'):
+                            failed_ids.append(item['id'])
+                    except json.JSONDecodeError:
+                        continue
+        
+        return failed_ids
+    
+    def is_cached(self, arxiv_id: str) -> bool:
+        """检查论文是否已缓存"""
+        return self.get(arxiv_id) is not None
+    
+    def get_stats(self) -> Dict:
+        """获取缓存统计信息"""
+        return {
+            'total_cached': len(self._cache),
+            'total_failed': len(self._failed_items),
+            'template_hash': self.template_hash,
+            'cache_dir': str(self.cache_dir)
+        }
 
 
 def fix_json_string(json_str: str) -> str:
@@ -191,6 +374,10 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, required=True, help="jsonline data file")
     parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of parallel workers")
+    parser.add_argument("--use-cache", action="store_true", default=True, help="Use AI result cache (default: True)")
+    parser.add_argument("--no-cache", action="store_true", help="Disable AI result cache")
+    parser.add_argument("--retry-failed", action="store_true", help="Only retry previously failed items")
+    parser.add_argument("--cache-dir", type=str, default=None, help="Custom cache directory path")
     return parser.parse_args()
 
 def process_single_item(chain, item: Dict, language: str) -> Dict:
@@ -338,8 +525,8 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
             return None
     return item
 
-def process_all_items(data: List[Dict], model_name: str, language: str, max_workers: int) -> List[Dict]:
-    """并行处理所有数据项"""
+def process_all_items(data: List[Dict], model_name: str, language: str, max_workers: int, cache: Optional[AICache] = None) -> List[Dict]:
+    """并行处理所有数据项，支持缓存"""
     llm = ChatOpenAI(model=model_name).with_structured_output(Structure, method="function_calling")
     print('Connect to:', model_name, file=sys.stderr)
     
@@ -350,30 +537,77 @@ def process_all_items(data: List[Dict], model_name: str, language: str, max_work
 
     chain = prompt_template | llm
     
-    # 使用线程池并行处理
-    processed_data = [None] * len(data)  # 预分配结果列表
+    # 分离已缓存和需要处理的数据
+    items_to_process = []
+    processed_data = [None] * len(data)
+    cached_count = 0
+    
+    for idx, item in enumerate(data):
+        arxiv_id = item.get('id')
+        
+        # 检查缓存
+        if cache:
+            cached_item = cache.get(arxiv_id)
+            if cached_item:
+                # 使用缓存结果，但更新原始数据中可能变化的字段
+                cached_item.update({
+                    'pdf': item.get('pdf'),
+                    'abs': item.get('abs'),
+                    'authors': item.get('authors'),
+                    'categories': item.get('categories'),
+                    'comment': item.get('comment'),
+                })
+                processed_data[idx] = cached_item
+                cached_count += 1
+                continue
+        
+        items_to_process.append((idx, item))
+    
+    if cached_count > 0:
+        print(f"Using {cached_count} cached results, processing {len(items_to_process)} new items", file=sys.stderr)
+    
+    # 如果所有数据都已缓存，直接返回
+    if not items_to_process:
+        print("All items were cached, no LLM calls needed!", file=sys.stderr)
+        return processed_data
+    
+    # 使用线程池并行处理未缓存的数据
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有任务
         future_to_idx = {
             executor.submit(process_single_item, chain, item, language): idx
-            for idx, item in enumerate(data)
+            for idx, item in items_to_process
         }
         
         # 使用tqdm显示进度
         for future in tqdm(
             as_completed(future_to_idx),
-            total=len(data),
+            total=len(items_to_process),
             desc="Processing items"
         ):
             idx = future_to_idx[future]
+            original_item = data[idx]
+            
             try:
                 result = future.result()
                 processed_data[idx] = result
+                
+                # 保存成功结果到缓存
+                if cache and result:
+                    cache.set(result)
+                elif cache and result is None:
+                    # 记录被过滤（敏感词）的情况
+                    cache.record_failure(original_item, "Filtered by sensitive word check")
+                    
             except Exception as e:
                 print(f"Item at index {idx} generated an exception: {e}", file=sys.stderr)
                 # Add default AI fields to ensure consistency
-                processed_data[idx] = data[idx]
+                processed_data[idx] = original_item
                 processed_data[idx]['AI'] = DEFAULT_AI_FIELDS.copy()
+                
+                # 记录失败
+                if cache:
+                    cache.record_failure(original_item, f"Exception: {type(e).__name__}: {str(e)}")
     
     return processed_data
 
@@ -387,6 +621,21 @@ def main():
     if os.path.exists(target_file):
         os.remove(target_file)
         print(f'Removed existing file: {target_file}', file=sys.stderr)
+
+    # 初始化缓存（除非明确禁用）
+    cache = None
+    use_cache = args.use_cache and not args.no_cache
+    
+    if use_cache:
+        cache = AICache(cache_dir=args.cache_dir)
+        
+        # 从数据文件名提取日期
+        data_filename = os.path.basename(args.data)
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', data_filename)
+        date_str = date_match.group(1) if date_match else None
+        
+        cache.load_cache(date_str)
+        print(f"Cache initialized: {cache.get_stats()}", file=sys.stderr)
 
     # 读取数据
     data = []
@@ -405,19 +654,47 @@ def main():
     data = unique_data
     print('Open:', args.data, file=sys.stderr)
     
+    # 如果是重试失败模式，只处理之前失败的论文
+    if args.retry_failed and cache:
+        data_filename = os.path.basename(args.data)
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', data_filename)
+        date_str = date_match.group(1) if date_match else None
+        
+        failed_ids = set(cache.get_failed_ids(date_str))
+        if failed_ids:
+            data = [item for item in data if item['id'] in failed_ids]
+            print(f"Retry mode: processing {len(data)} previously failed items", file=sys.stderr)
+        else:
+            print("No failed items to retry", file=sys.stderr)
+    
     # 并行处理所有数据
     processed_data = process_all_items(
         data,
         model_name,
         language,
-        args.max_workers
+        args.max_workers,
+        cache=cache
     )
+    
+    # 保存缓存
+    if cache:
+        data_filename = os.path.basename(args.data)
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', data_filename)
+        date_str = date_match.group(1) if date_match else None
+        
+        cache.save_cache(date_str)
+        cache.save_failures(date_str)
+        
+        stats = cache.get_stats()
+        print(f"Final cache stats: {stats}", file=sys.stderr)
     
     # 保存结果
     with open(target_file, "w") as f:
         for item in processed_data:
             if item is not None:
-                f.write(json.dumps(item) + "\n")
+                # 移除内部缓存字段
+                item_to_save = {k: v for k, v in item.items() if not k.startswith('_')}
+                f.write(json.dumps(item_to_save) + "\n")
 
 if __name__ == "__main__":
     main()
