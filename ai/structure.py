@@ -12,19 +12,19 @@ class Structure(BaseModel):
     )
     motivation: str = Field(
         default="动机分析不可用",
-        description="描述论文的研究动机和背景 / Describe the research motivation and background of the paper"
+        description="描述论文的研究动机和背景 / Describe the research motivation and background"
     )
     method: str = Field(
         default="方法提取失败",
-        description="提取论文的研究方法 / Extract the research method of the paper"
+        description="提取论文的研究方法 / Extract the research method used"
     )
     result: str = Field(
         default="结果分析不可用",
-        description="总结论文的主要结果 / Summarize the main results of the paper"
+        description="总结论文的主要结果 / Summarize the main results"
     )
     conclusion: str = Field(
         default="结论提取失败",
-        description="提取论文的结论 / Extract the conclusion of the paper"
+        description="提取论文的结论 / Extract the conclusion"
     )
 
     @field_validator('*', mode='before')

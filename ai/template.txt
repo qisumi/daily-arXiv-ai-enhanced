@@ -2,7 +2,8 @@
 Please analyze the following academic paper abstract and generate structured information in {language}.
 
 要求 / Requirements:
-- 必须使用{language}输出所有字段（tldr、motivation、method、result、conclusion）/ Must output all fields in {language} (tldr, motivation, method, result, conclusion)
+- 必须使用{language}输出所有字段 / Must output all fields in {language}
+  (字段包括 / Fields include: tldr, motivation, method, result, conclusion - 参见 structure.py / see structure.py)
 - 保持专业性和准确性 / Maintain professionalism and accuracy
 - 提取关键信息，避免冗余 / Extract key information, avoid redundancy
 
