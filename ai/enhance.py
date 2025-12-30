@@ -3,7 +3,7 @@ import json
 import sys
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict
+from typing import List, Dict, Optional
 from queue import Queue
 from threading import Lock
 # INSERT_YOUR_CODE
@@ -12,6 +12,13 @@ import requests
 import dotenv
 import argparse
 from tqdm import tqdm
+
+# 尝试导入 json5，如果不可用则回退到标准 json
+try:
+    import json5
+    HAS_JSON5 = True
+except ImportError:
+    HAS_JSON5 = False
 
 import langchain_core.exceptions
 from langchain_openai import ChatOpenAI
@@ -26,6 +33,158 @@ if os.path.exists('.env'):
     dotenv.load_dotenv()
 template = open("template.txt", "r").read()
 system = open("system.txt", "r").read()
+
+# 默认 AI 字段值
+DEFAULT_AI_FIELDS = {
+    "tldr": "Summary generation failed",
+    "motivation": "Motivation analysis unavailable",
+    "method": "Method extraction failed",
+    "result": "Result analysis unavailable",
+    "conclusion": "Conclusion extraction failed"
+}
+
+
+def fix_json_string(json_str: str) -> str:
+    """
+    修复常见的 JSON 格式问题
+    
+    处理以下情况:
+    - LaTeX 中的反斜杠
+    - 未转义的换行符
+    - 控制字符
+    - 不完整的 JSON 结构
+    """
+    if not json_str:
+        return "{}"
+    
+    # 1. 处理 LaTeX 中的反斜杠 (只转义非标准转义序列)
+    # 标准 JSON 转义: \", \\, \/, \b, \f, \n, \r, \t, \uXXXX
+    json_str = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', json_str)
+    
+    # 2. 处理未转义的换行符和特殊字符
+    # 需要在字符串值内部处理，避免破坏 JSON 结构
+    def escape_string_content(match):
+        content = match.group(1)
+        content = content.replace('\n', '\\n')
+        content = content.replace('\r', '\\r')
+        content = content.replace('\t', '\\t')
+        return f'"{content}"'
+    
+    # 匹配 JSON 字符串值 (简单版本)
+    json_str = re.sub(r'"((?:[^"\\]|\\.)*?)"', escape_string_content, json_str, flags=re.DOTALL)
+    
+    # 3. 移除控制字符
+    json_str = re.sub(r'[\x00-\x1f](?<![\n\r\t])', '', json_str)
+    
+    # 4. 尝试修复不完整的 JSON
+    json_str = json_str.strip()
+    
+    # 修复缺少结束引号
+    if json_str.count('"') % 2 != 0:
+        json_str += '"'
+    
+    # 修复缺少结束括号
+    open_braces = json_str.count('{') - json_str.count('}')
+    if open_braces > 0:
+        json_str += '}' * open_braces
+    
+    return json_str
+
+
+def extract_fields_with_regex(text: str) -> Dict[str, str]:
+    """
+    使用正则表达式从文本中提取各字段
+    作为 JSON 解析失败时的回退方案
+    """
+    result = {}
+    
+    # 定义各字段的匹配模式
+    field_patterns = {
+        'tldr': [
+            r'"tldr"\s*:\s*"((?:[^"\\]|\\.)*)"',
+            r'tldr[:\s]+([^\n]+)',
+            r'TL;?DR[:\s]+([^\n]+)',
+        ],
+        'motivation': [
+            r'"motivation"\s*:\s*"((?:[^"\\]|\\.)*)"',
+            r'motivation[:\s]+([^\n]+)',
+        ],
+        'method': [
+            r'"method"\s*:\s*"((?:[^"\\]|\\.)*)"',
+            r'method[:\s]+([^\n]+)',
+        ],
+        'result': [
+            r'"result"\s*:\s*"((?:[^"\\]|\\.)*)"',
+            r'result[:\s]+([^\n]+)',
+        ],
+        'conclusion': [
+            r'"conclusion"\s*:\s*"((?:[^"\\]|\\.)*)"',
+            r'conclusion[:\s]+([^\n]+)',
+        ],
+    }
+    
+    for field, patterns in field_patterns.items():
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+            if match:
+                value = match.group(1).strip()
+                # 清理提取的值
+                value = value.strip('"\'')
+                value = re.sub(r'\s+', ' ', value)
+                if value and len(value) > 5:  # 确保有意义的内容
+                    result[field] = value
+                    break
+    
+    return result
+
+
+def robust_parse_json(json_str: str, default_fields: Dict[str, str]) -> Dict[str, str]:
+    """
+    使用多重策略解析 JSON 字符串
+    
+    策略顺序:
+    1. 标准 JSON 解析
+    2. 修复后的 JSON 解析
+    3. json5 宽容解析 (如果可用)
+    4. 正则表达式提取
+    5. 返回默认值
+    """
+    if not json_str:
+        return default_fields.copy()
+    
+    # 策略 1: 尝试标准 JSON 解析
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        pass
+    
+    # 策略 2: 修复后重新解析
+    fixed_json = fix_json_string(json_str)
+    try:
+        return json.loads(fixed_json)
+    except json.JSONDecodeError:
+        pass
+    
+    # 策略 3: 使用 json5 进行宽容解析 (支持尾逗号、注释等)
+    if HAS_JSON5:
+        try:
+            return json5.loads(json_str)
+        except:
+            pass
+        try:
+            return json5.loads(fixed_json)
+        except:
+            pass
+    
+    # 策略 4: 使用正则表达式提取字段
+    extracted = extract_fields_with_regex(json_str)
+    if extracted:
+        print(f"Used regex extraction, found fields: {list(extracted.keys())}", file=sys.stderr)
+        return {**default_fields, **extracted}
+    
+    # 策略 5: 返回默认值
+    return default_fields.copy()
+
 
 def parse_args():
     """解析命令行参数"""
@@ -115,15 +274,6 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
         item.update(code_info)
 
     """处理单个数据项"""
-    # Default structure with meaningful fallback values
-    default_ai_fields = {
-        "tldr": "Summary generation failed",
-        "motivation": "Motivation analysis unavailable",
-        "method": "Method extraction failed",
-        "result": "Result analysis unavailable",
-        "conclusion": "Conclusion extraction failed"
-    }
-    
     try:
         response: Structure = chain.invoke({
             "language": language,
@@ -131,33 +281,56 @@ def process_single_item(chain, item: Dict, language: str) -> Dict:
         })
         item['AI'] = response.model_dump()
     except langchain_core.exceptions.OutputParserException as e:
-        # 尝试从错误信息中提取 JSON 字符串并修复
+        # 尝试从错误信息中提取并修复 JSON
         error_msg = str(e)
         partial_data = {}
         
-        if "Function Structure arguments:" in error_msg:
-            try:
-                # 提取 JSON 字符串
-                json_str = error_msg.split("Function Structure arguments:", 1)[1].strip().split('are not valid JSON')[0].strip()
-                # 预处理 LaTeX 数学符号 - 使用四个反斜杠来确保正确转义
-                json_str = json_str.replace('\\', '\\\\')
-                # 尝试解析修复后的 JSON
-                partial_data = json.loads(json_str)
-            except Exception as json_e:
-                print(f"Failed to parse JSON for {item.get('id', 'unknown')}: {json_e}", file=sys.stderr)
+        # 尝试多种方式提取 JSON
+        json_candidates = []
         
-        # Merge partial data with defaults to ensure all fields exist
-        item['AI'] = {**default_ai_fields, **partial_data}
-        print(f"Using partial AI data for {item.get('id', 'unknown')}: {list(partial_data.keys())}", file=sys.stderr)
+        # 方式1: 从 "Function Structure arguments:" 后提取
+        if "Function Structure arguments:" in error_msg:
+            json_str = error_msg.split("Function Structure arguments:", 1)[1]
+            json_str = json_str.split('are not valid JSON')[0].strip()
+            json_candidates.append(json_str)
+        
+        # 方式2: 从 "Invalid json output:" 后提取
+        if "Invalid json output:" in error_msg:
+            json_str = error_msg.split("Invalid json output:", 1)[1].strip()
+            json_candidates.append(json_str)
+        
+        # 方式3: 尝试直接从错误信息中找 JSON 对象
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', error_msg, re.DOTALL)
+        if json_match:
+            json_candidates.append(json_match.group(0))
+        
+        # 尝试解析每个候选 JSON
+        for candidate in json_candidates:
+            if candidate:
+                parsed = robust_parse_json(candidate, DEFAULT_AI_FIELDS)
+                if parsed and parsed != DEFAULT_AI_FIELDS:
+                    partial_data = parsed
+                    break
+        
+        # 如果所有方式都失败，尝试从整个错误信息中提取字段
+        if not partial_data or partial_data == DEFAULT_AI_FIELDS:
+            partial_data = extract_fields_with_regex(error_msg)
+        
+        item['AI'] = {**DEFAULT_AI_FIELDS, **partial_data}
+        if partial_data and partial_data != DEFAULT_AI_FIELDS:
+            print(f"Recovered partial AI data for {item.get('id', 'unknown')}: {list(partial_data.keys())}", file=sys.stderr)
+        else:
+            print(f"Using default AI data for {item.get('id', 'unknown')} due to parse error", file=sys.stderr)
+            
     except Exception as e:
         # Catch any other exceptions and provide default values
-        print(f"Unexpected error for {item.get('id', 'unknown')}: {e}", file=sys.stderr)
-        item['AI'] = default_ai_fields
+        print(f"Unexpected error for {item.get('id', 'unknown')}: {type(e).__name__}: {e}", file=sys.stderr)
+        item['AI'] = DEFAULT_AI_FIELDS.copy()
     
     # Final validation to ensure all required fields exist
-    for field in default_ai_fields.keys():
-        if field not in item['AI']:
-            item['AI'][field] = default_ai_fields[field]
+    for field, default_value in DEFAULT_AI_FIELDS.items():
+        if field not in item['AI'] or not item['AI'][field]:
+            item['AI'][field] = default_value
 
     # 检查 AI 生成的所有字段
     for v in item.get("AI", {}).values():
@@ -200,13 +373,7 @@ def process_all_items(data: List[Dict], model_name: str, language: str, max_work
                 print(f"Item at index {idx} generated an exception: {e}", file=sys.stderr)
                 # Add default AI fields to ensure consistency
                 processed_data[idx] = data[idx]
-                processed_data[idx]['AI'] = {
-                    "tldr": "Processing failed",
-                    "motivation": "Processing failed",
-                    "method": "Processing failed",
-                    "result": "Processing failed",
-                    "conclusion": "Processing failed"
-                }
+                processed_data[idx]['AI'] = DEFAULT_AI_FIELDS.copy()
     
     return processed_data
 
