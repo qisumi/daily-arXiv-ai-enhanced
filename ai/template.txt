@@ -1,4 +1,14 @@
-Please analyze the following abstract of papers. 
+请分析以下学术论文摘要，并用{language}生成结构化信息。
+Please analyze the following academic paper abstract and generate structured information in {language}.
 
-Content:
+要求 / Requirements:
+- 必须使用{language}输出所有字段 / Must output all fields in {language}
+  (字段包括 / Fields include: tldr, motivation, method, result, conclusion - 参见 structure.py / see structure.py)
+- 保持专业性和准确性 / Maintain professionalism and accuracy
+- 提取关键信息，避免冗余 / Extract key information, avoid redundancy
+
+论文摘要内容 / Paper Abstract:
 {content}
+
+请严格按照要求的结构化格式输出，确保所有内容都使用{language}。
+Please strictly follow the required structured format and ensure all content is in {language}.

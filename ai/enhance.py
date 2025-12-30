@@ -39,11 +39,11 @@ system = open("system.txt", "r").read()
 
 # 默认 AI 字段值
 DEFAULT_AI_FIELDS = {
-    "tldr": "Summary generation failed",
-    "motivation": "Motivation analysis unavailable",
-    "method": "Method extraction failed",
-    "result": "Result analysis unavailable",
-    "conclusion": "Conclusion extraction failed"
+    "tldr": "摘要生成失败",
+    "motivation": "动机分析不可用",
+    "method": "方法提取失败",
+    "result": "结果分析不可用",
+    "conclusion": "结论提取失败"
 }
 
 

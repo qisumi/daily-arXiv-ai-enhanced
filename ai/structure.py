@@ -7,24 +7,24 @@ class Structure(BaseModel):
     """论文结构化信息模型，带有宽容的字段验证"""
     
     tldr: str = Field(
-        default="Summary not available",
-        description="generate a too long; didn't read summary"
+        default="摘要生成失败",
+        description="生成论文的简短摘要（TL;DR）/ Generate a concise summary (TL;DR) of the paper"
     )
     motivation: str = Field(
-        default="Motivation not available",
-        description="describe the motivation in this paper"
+        default="动机分析不可用",
+        description="描述论文的研究动机和背景 / Describe the research motivation and background"
     )
     method: str = Field(
-        default="Method not available",
-        description="method of this paper"
+        default="方法提取失败",
+        description="提取论文的研究方法 / Extract the research method used"
     )
     result: str = Field(
-        default="Result not available",
-        description="result of this paper"
+        default="结果分析不可用",
+        description="总结论文的主要结果 / Summarize the main results"
     )
     conclusion: str = Field(
-        default="Conclusion not available",
-        description="conclusion of this paper"
+        default="结论提取失败",
+        description="提取论文的结论 / Extract the conclusion"
     )
 
     @field_validator('*', mode='before')
